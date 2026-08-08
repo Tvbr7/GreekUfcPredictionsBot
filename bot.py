@@ -15,12 +15,13 @@ from telegram.ext import (
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PAYMENT_LINK = os.environ["PAYMENT_LINK"]
+ADMIN_ID = 8149217025
 
 DB = "users.db"
 
 
 # --------------------------------------------------
-# Μικρός HTTP server για το Render
+# HTTP SERVER ΓΙΑ RENDER
 # --------------------------------------------------
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -50,7 +51,7 @@ def start_web_server():
 
 
 # --------------------------------------------------
-# Database
+# DATABASE
 # --------------------------------------------------
 
 def init_db():
@@ -109,7 +110,7 @@ def get_setting(key):
 
 
 # --------------------------------------------------
-# Users
+# USERS
 # --------------------------------------------------
 
 def save_user(user_id, username):
@@ -127,16 +128,21 @@ def save_user(user_id, username):
     conn.close()
 
 
-def get_user(user_id):
+def get_user_by_username(username):
+
+    username = username.replace("@", "").lower()
 
     conn = sqlite3.connect(DB)
 
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT user_id, username, expires_at "
-        "FROM users WHERE user_id = ?",
-        (user_id,)
+        """
+        SELECT user_id, username, expires_at
+        FROM users
+        WHERE LOWER(username) = ?
+        """,
+        (username,)
     )
 
     result = cur.fetchone()
@@ -166,31 +172,36 @@ def activate_user(user_id):
 
 
 # --------------------------------------------------
-# Telegram
+# ADMIN CHECK
+# --------------------------------------------------
+
+def is_admin(user_id):
+
+    return user_id == ADMIN_ID
+
+
+# --------------------------------------------------
+# START
 # --------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
 
+    username = user.username
+
+    if username:
+
+        username = username.lower()
+
+    else:
+
+        username = user.first_name
+
     save_user(
         user.id,
-        user.username or user.first_name
+        username
     )
-
-    admin_id = get_setting("admin_id")
-
-    if not admin_id:
-
-        set_setting(
-            "admin_id",
-            str(user.id)
-        )
-
-        await update.message.reply_text(
-            "✅ Είσαι πλέον ο διαχειριστής του bot.\n\n"
-            "Χρησιμοποίησε /admin για τις επιλογές διαχείρισης."
-        )
 
     keyboard = [
 
@@ -219,14 +230,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         "1️⃣ Πάτησε «Πληρωμή 10€».\n"
         "2️⃣ Κάνε την πληρωμή μέσω Revolut.\n"
-        "3️⃣ Στείλε το Telegram username σου "
+        "3️⃣ Γράψε το Telegram username σου "
         "στη σημείωση της πληρωμής.\n"
         "4️⃣ Μετά την επιβεβαίωση θα ενεργοποιήσω "
-        "χειροκίνητα την πρόσβασή σου.",
+        "χειροκίνητα την πρόσβασή σου.\n\n"
+
+        "⚠️ Πρέπει να έχεις πατήσει START "
+        "στο bot για να μπορέσω να σε ενεργοποιήσω.",
 
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+
+# --------------------------------------------------
+# STATUS
+# --------------------------------------------------
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -234,9 +252,20 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    user = get_user(query.from_user.id)
+    conn = sqlite3.connect(DB)
 
-    if not user or not user[2]:
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT expires_at FROM users WHERE user_id = ?",
+        (query.from_user.id,)
+    )
+
+    result = cur.fetchone()
+
+    conn.close()
+
+    if not result or not result[0]:
 
         await query.message.reply_text(
             "❌ Δεν έχεις ενεργή συνδρομή."
@@ -244,13 +273,24 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    expires = datetime.fromisoformat(user[2])
+    expires = datetime.fromisoformat(result[0])
 
     if expires <= datetime.now(timezone.utc):
 
         await query.message.reply_text(
+
             "❌ Η συνδρομή σου έχει λήξει.\n\n"
-            "Πάτησε «Πληρωμή 10€» για ανανέωση."
+            "Πάτησε «Πληρωμή 10€» για ανανέωση.",
+
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "💳 Πληρωμή 10€",
+                        url=PAYMENT_LINK
+                    )
+                ]
+            ])
+
         )
 
     else:
@@ -258,7 +298,6 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
 
             "✅ Η συνδρομή σου είναι ενεργή.\n\n"
-
             f"📅 Λήγει: "
             f"{expires.strftime('%d/%m/%Y %H:%M')}"
 
@@ -266,15 +305,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------
-# Admin
+# ADMIN
 # --------------------------------------------------
-
-def is_admin(user_id):
-
-    admin_id = get_setting("admin_id")
-
-    return admin_id and int(admin_id) == user_id
-
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -286,7 +318,7 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         "🔐 ΠΙΝΑΚΑΣ ΔΙΑΧΕΙΡΙΣΤΗ\n\n"
 
-        "/activate USER_ID - Ενεργοποίηση 30 ημερών\n"
+        "/activate @username - Ενεργοποίηση 30 ημερών\n"
         "/users - Λίστα χρηστών\n"
         "/channel - ID καναλιού\n"
         "/myid - Το δικό σου ID"
@@ -303,6 +335,10 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     )
 
+
+# --------------------------------------------------
+# CHANNEL ID
+# --------------------------------------------------
 
 async def channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -333,10 +369,6 @@ async def channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# --------------------------------------------------
-# Bot added to channel
-# --------------------------------------------------
-
 async def bot_added_to_channel(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -363,7 +395,7 @@ async def bot_added_to_channel(
 
 
 # --------------------------------------------------
-# Activate user
+# ACTIVATE BY USERNAME
 # --------------------------------------------------
 
 async def activate(
@@ -380,36 +412,30 @@ async def activate(
         await update.message.reply_text(
 
             "Χρήση:\n\n"
-            "/activate USER_ID"
+            "/activate @username"
 
         )
 
         return
 
-    try:
+    username = context.args[0].replace("@", "")
 
-        user_id = int(context.args[0])
-
-    except ValueError:
-
-        await update.message.reply_text(
-            "❌ Λάθος User ID."
-        )
-
-        return
-
-    user = get_user(user_id)
+    user = get_user_by_username(username)
 
     if not user:
 
         await update.message.reply_text(
 
-            "❌ Δεν βρέθηκε ο χρήστης.\n\n"
-            "Πρέπει πρώτα να έχει κάνει /start στο bot."
+            "❌ Δεν βρέθηκε αυτό το username.\n\n"
+
+            "Ο χρήστης πρέπει πρώτα να έχει "
+            "πατήσει START στο bot."
 
         )
 
         return
+
+    user_id = user[0]
 
     channel_id = get_setting("channel_id")
 
@@ -417,7 +443,7 @@ async def activate(
 
         await update.message.reply_text(
 
-            "❌ Δεν έχω βρει ακόμα το ID του καναλιού."
+            "❌ Δεν έχω βρει το ID του καναλιού."
 
         )
 
@@ -471,9 +497,10 @@ async def activate(
 
         await update.message.reply_text(
 
-            "✅ Ο χρήστης ενεργοποιήθηκε.\n\n"
+            "✅ ΕΝΕΡΓΟΠΟΙΗΘΗΚΕ\n\n"
 
-            f"👤 ID: {user_id}\n"
+            f"👤 @{username}\n"
+
             f"📅 Λήξη: "
             f"{expires.strftime('%d/%m/%Y %H:%M')}"
 
@@ -483,13 +510,13 @@ async def activate(
 
         await update.message.reply_text(
 
-            f"❌ Σφάλμα:\n{e}"
+            f"❌ Παρουσιάστηκε σφάλμα:\n{e}"
 
         )
 
 
 # --------------------------------------------------
-# Users list
+# USERS
 # --------------------------------------------------
 
 async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -527,7 +554,7 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text += (
 
-            f"👤 {username or '-'}\n"
+            f"👤 @{username}\n"
             f"ID: {user_id}\n"
             f"Λήξη: {expires or '❌ Μη ενεργός'}\n\n"
 
@@ -537,7 +564,7 @@ async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------
-# Expired users
+# EXPIRED USERS
 # --------------------------------------------------
 
 async def check_expired(
@@ -635,23 +662,21 @@ async def check_expired(
             except Exception as e:
 
                 print(
-                    f"Error removing {user_id}: {e}"
+                    f"Error removing user {user_id}: {e}"
                 )
 
     conn.commit()
-
     conn.close()
 
 
 # --------------------------------------------------
-# Main
+# MAIN
 # --------------------------------------------------
 
 def main():
 
     init_db()
 
-    # Ξεκινάμε HTTP server για Render
     web_thread = threading.Thread(
         target=start_web_server,
         daemon=True
