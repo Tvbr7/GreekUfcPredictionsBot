@@ -2,17 +2,16 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
+    ChatMemberHandler,
 )
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL_ID = int(os.environ["CHANNEL_ID"])
-ADMIN_ID = int(os.environ["ADMIN_ID"])
 PAYMENT_LINK = os.environ["PAYMENT_LINK"]
 
 DB = "users.db"
@@ -21,6 +20,13 @@ DB = "users.db"
 def init_db():
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -34,33 +40,43 @@ def init_db():
     conn.close()
 
 
+def set_setting(key, value):
+    conn = sqlite3.connect(DB)
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (key, value)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_setting(key):
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        (key,)
+    )
+
+    result = cur.fetchone()
+    conn.close()
+
+    return result[0] if result else None
+
+
 def save_user(user_id, username):
     conn = sqlite3.connect(DB)
-    conn.execute(
-        "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
-        (user_id, username)
-    )
-    conn.commit()
-    conn.close()
 
-
-def activate_user(user_id):
-    expires = datetime.now(timezone.utc) + timedelta(days=30)
-
-    conn = sqlite3.connect(DB)
-    conn.execute(
-        """
-        INSERT INTO users (user_id, expires_at)
+    conn.execute("""
+        INSERT INTO users (user_id, username)
         VALUES (?, ?)
         ON CONFLICT(user_id)
-        DO UPDATE SET expires_at = excluded.expires_at
-        """,
-        (user_id, expires.isoformat())
-    )
+        DO UPDATE SET username = excluded.username
+    """, (user_id, username))
+
     conn.commit()
     conn.close()
-
-    return expires
 
 
 def get_user(user_id):
@@ -78,7 +94,26 @@ def get_user(user_id):
     return result
 
 
+def activate_user(user_id):
+    expires = datetime.now(timezone.utc) + timedelta(days=30)
+
+    conn = sqlite3.connect(DB)
+
+    conn.execute("""
+        INSERT INTO users (user_id, expires_at)
+        VALUES (?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET expires_at = excluded.expires_at
+    """, (user_id, expires.isoformat()))
+
+    conn.commit()
+    conn.close()
+
+    return expires
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     user = update.effective_user
 
     save_user(
@@ -86,75 +121,199 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user.username or user.first_name
     )
 
+    # Ο πρώτος χρήστης που κάνει /start μπορεί να γίνει admin
+    admin_id = get_setting("admin_id")
+
+    if not admin_id:
+        set_setting("admin_id", str(user.id))
+
+        await update.message.reply_text(
+            "✅ Ο λογαριασμός σου ορίστηκε ως διαχειριστής του bot.\n\n"
+            "Τώρα μπορείς να χρησιμοποιήσεις /admin."
+        )
+
     keyboard = [
-        [InlineKeyboardButton("💳 Πληρωμή 10€", url=PAYMENT_LINK)],
-        [InlineKeyboardButton("📅 Η συνδρομή μου", callback_data="status")]
+        [
+            InlineKeyboardButton(
+                "💳 Πληρωμή 10€",
+                url=PAYMENT_LINK
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📅 Η συνδρομή μου",
+                callback_data="status"
+            )
+        ]
     ]
 
     await update.message.reply_text(
-        "Καλώς ήρθες!\n\n"
-        "Η πρόσβαση στο κανάλι κοστίζει 10€ για 30 ημέρες.\n\n"
-        "1️⃣ Πλήρωσε 10€ από το παρακάτω link.\n"
-        "2️⃣ Μετά την πληρωμή, περίμενε να επιβεβαιώσουμε την πληρωμή σου.\n"
-        "3️⃣ Η πρόσβαση ενεργοποιείται χειροκίνητα.",
+        "👋 Καλώς ήρθες!\n\n"
+        "Η πρόσβαση στο private κανάλι κοστίζει "
+        "10€ για 30 ημέρες.\n\n"
+        "1️⃣ Πάτησε «Πληρωμή 10€».\n"
+        "2️⃣ Κάνε την πληρωμή μέσω Revolut.\n"
+        "3️⃣ Μετά την πληρωμή περιμένεις "
+        "τη χειροκίνητη επιβεβαίωση.",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     query = update.callback_query
     await query.answer()
 
     user = get_user(query.from_user.id)
 
     if not user or not user[2]:
+
         await query.message.reply_text(
             "❌ Δεν έχεις ενεργή συνδρομή."
         )
+
         return
 
     expires = datetime.fromisoformat(user[2])
 
     if expires <= datetime.now(timezone.utc):
+
         await query.message.reply_text(
-            "❌ Η συνδρομή σου έχει λήξει."
+            "❌ Η συνδρομή σου έχει λήξει.\n\n"
+            "Πάτησε «Πληρωμή 10€» για ανανέωση."
         )
+
     else:
+
         await query.message.reply_text(
-            f"✅ Η συνδρομή σου είναι ενεργή.\n\n"
-            f"Λήγει: {expires.strftime('%d/%m/%Y %H:%M')}"
+            "✅ Η συνδρομή σου είναι ενεργή.\n\n"
+            f"📅 Λήγει: {expires.strftime('%d/%m/%Y %H:%M')}"
+        )
+
+
+def is_admin(user_id):
+
+    admin_id = get_setting("admin_id")
+
+    return admin_id and int(admin_id) == user_id
+
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    await update.message.reply_text(
+        "🔐 Πίνακας διαχειριστή\n\n"
+        "/activate USER_ID - Ενεργοποίηση 30 ημερών\n"
+        "/users - Λίστα χρηστών\n"
+        "/channel - Εμφάνιση ID καναλιού\n"
+        "/myid - Εμφάνιση δικού σου ID"
+    )
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await update.message.reply_text(
+        f"Το Telegram ID σου είναι:\n\n"
+        f"{update.effective_user.id}"
+    )
+
+
+async def channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    channel_id = get_setting("channel_id")
+
+    if channel_id:
+
+        await update.message.reply_text(
+            f"📢 Το ID του καναλιού είναι:\n\n"
+            f"`{channel_id}`",
+            parse_mode="Markdown"
+        )
+
+    else:
+
+        await update.message.reply_text(
+            "❌ Δεν έχω καταγράψει ακόμα το ID του καναλιού.\n\n"
+            "Στείλε ένα νέο μήνυμα στο κανάλι "
+            "αφού το bot είναι διαχειριστής."
+        )
+
+
+async def bot_added_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    member_update = update.my_chat_member
+
+    if not member_update:
+        return
+
+    chat = member_update.chat
+
+    # Αποθηκεύουμε το ID του καναλιού
+    if chat.type == "channel":
+
+        set_setting(
+            "channel_id",
+            str(chat.id)
         )
 
 
 async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+
+    if not is_admin(update.effective_user.id):
         return
 
     if not context.args:
+
         await update.message.reply_text(
-            "Χρήση:\n/activate USER_ID"
+            "Χρήση:\n\n"
+            "/activate USER_ID"
         )
+
         return
 
     try:
+
         user_id = int(context.args[0])
+
     except ValueError:
-        await update.message.reply_text("❌ Μη έγκυρο User ID.")
+
+        await update.message.reply_text(
+            "❌ Το User ID δεν είναι σωστό."
+        )
+
         return
 
     user = get_user(user_id)
 
     if not user:
+
         await update.message.reply_text(
             "❌ Δεν βρέθηκε αυτός ο χρήστης."
         )
+
+        return
+
+    channel_id = get_setting("channel_id")
+
+    if not channel_id:
+
+        await update.message.reply_text(
+            "❌ Δεν έχει καταχωρηθεί το ID του καναλιού."
+        )
+
         return
 
     expires = activate_user(user_id)
 
     try:
+
         invite = await context.bot.create_chat_invite_link(
-            chat_id=CHANNEL_ID,
+            chat_id=int(channel_id),
             member_limit=1
         )
 
@@ -163,87 +322,104 @@ async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=(
                 "✅ Η πληρωμή σου επιβεβαιώθηκε!\n\n"
                 "Η συνδρομή σου ενεργοποιήθηκε για 30 ημέρες.\n\n"
-                "👇 Πάτησε τον σύνδεσμο για να μπεις στο κανάλι:"
+                "Πάτησε παρακάτω για να μπεις στο private κανάλι."
             ),
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "🔐 ΕΙΣΟΔΟΣ ΣΤΟ ΚΑΝΑΛΙ",
-                    url=invite.invite_link
-                )]
+                [
+                    InlineKeyboardButton(
+                        "🔐 ΕΙΣΟΔΟΣ ΣΤΟ ΚΑΝΑΛΙ",
+                        url=invite.invite_link
+                    )
+                ]
             ])
         )
 
         await update.message.reply_text(
-            f"✅ Ενεργοποιήθηκε ο χρήστης {user_id}.\n"
-            f"Λήξη: {expires.strftime('%d/%m/%Y %H:%M')}"
+            "✅ Ο χρήστης ενεργοποιήθηκε.\n\n"
+            f"👤 ID: {user_id}\n"
+            f"📅 Λήξη: {expires.strftime('%d/%m/%Y %H:%M')}"
         )
 
     except Exception as e:
+
         await update.message.reply_text(
-            f"❌ Έγινε ενεργοποίηση αλλά δεν μπόρεσα "
-            f"να δημιουργήσω σύνδεσμο εισόδου.\n\n{e}"
+            f"❌ Παρουσιάστηκε σφάλμα:\n{e}"
         )
 
 
 async def users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+
+    if not is_admin(update.effective_user.id):
         return
 
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT user_id, username, expires_at FROM users ORDER BY expires_at"
+        "SELECT user_id, username, expires_at "
+        "FROM users ORDER BY expires_at"
     )
 
     rows = cur.fetchall()
+
     conn.close()
 
     if not rows:
-        await update.message.reply_text("Δεν υπάρχουν χρήστες.")
+
+        await update.message.reply_text(
+            "Δεν υπάρχουν χρήστες."
+        )
+
         return
 
     text = "👥 ΧΡΗΣΤΕΣ\n\n"
 
     for user_id, username, expires in rows:
+
         text += (
             f"👤 {username or '-'}\n"
-            f"ID: `{user_id}`\n"
-            f"Λήξη: {expires or 'Μη ενεργός'}\n\n"
+            f"ID: {user_id}\n"
+            f"Λήξη: {expires or '❌ Μη ενεργός'}\n\n"
         )
 
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text(text)
 
 
 async def check_expired(context: ContextTypes.DEFAULT_TYPE):
+
+    channel_id = get_setting("channel_id")
+
+    if not channel_id:
+        return
+
     now = datetime.now(timezone.utc)
 
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT user_id, expires_at FROM users WHERE expires_at IS NOT NULL"
+        "SELECT user_id, expires_at "
+        "FROM users WHERE expires_at IS NOT NULL"
     )
 
     rows = cur.fetchall()
 
     for user_id, expires_at in rows:
+
         expires = datetime.fromisoformat(expires_at)
 
         if expires <= now:
+
             try:
+
                 await context.bot.ban_chat_member(
-                    chat_id=CHANNEL_ID,
+                    chat_id=int(channel_id),
                     user_id=user_id
                 )
 
                 await context.bot.unban_chat_member(
-                    chat_id=CHANNEL_ID,
-                    user_id=user_id,
-                    only_if_banned=True
+                    chat_id=int(channel_id),
+                    user_id=user_id
                 )
 
                 await context.bot.send_message(
@@ -254,15 +430,18 @@ async def check_expired(context: ContextTypes.DEFAULT_TYPE):
                         "χρειάζεται νέα πληρωμή 10€."
                     ),
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(
-                            "💳 ΠΛΗΡΩΜΗ 10€",
-                            url=PAYMENT_LINK
-                        )]
+                        [
+                            InlineKeyboardButton(
+                                "💳 ΠΛΗΡΩΜΗ 10€",
+                                url=PAYMENT_LINK
+                            )
+                        ]
                     ])
                 )
 
                 cur.execute(
-                    "UPDATE users SET expires_at = NULL WHERE user_id = ?",
+                    "UPDATE users SET expires_at = NULL "
+                    "WHERE user_id = ?",
                     (user_id,)
                 )
 
@@ -274,14 +453,52 @@ async def check_expired(context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("activate", activate))
-    app.add_handler(CommandHandler("users", users))
-    app.add_handler(CallbackQueryHandler(status, pattern="^status$"))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CommandHandler("admin", admin)
+    )
+
+    app.add_handler(
+        CommandHandler("myid", myid)
+    )
+
+    app.add_handler(
+        CommandHandler("channel", channel)
+    )
+
+    app.add_handler(
+        CommandHandler("activate", activate)
+    )
+
+    app.add_handler(
+        CommandHandler("users", users)
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            status,
+            pattern="^status$"
+        )
+    )
+
+    app.add_handler(
+        ChatMemberHandler(
+            bot_added_to_channel,
+            ChatMemberHandler.MY_CHAT_MEMBER
+        )
+    )
 
     app.job_queue.run_repeating(
         check_expired,
@@ -289,7 +506,8 @@ def main():
         first=60
     )
 
-    print("Bot started...")
+    print("Bot started.")
+
     app.run_polling()
 
 
